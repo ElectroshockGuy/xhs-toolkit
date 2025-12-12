@@ -90,3 +90,4 @@ data/redink_output
 .cursorrules
 .cursorignore
 .cursorignore
+*screenshot.png

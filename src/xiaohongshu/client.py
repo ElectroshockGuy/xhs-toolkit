@@ -120,6 +120,8 @@ class XHSClient:
             # 处理文件上传（图片/视频）
             await self._handle_file_upload(note)
             
+            # 等待发布按钮出现
+            
             # 填写笔记内容
             await self._fill_note_content(note)
             
@@ -144,56 +146,185 @@ class XHSClient:
             
             if has_images:
                 logger.info("🔄 切换到图文发布模式...")
-                # 查找"上传图文"选项卡
-                try:
-                    # 查找所有creator-tab元素
-                    tabs = driver.find_elements(By.CSS_SELECTOR, ".creator-tab")
-                    image_tab = None
-                    
-                    for tab in tabs:
-                        if tab.is_displayed() and "上传图文" in tab.text:
-                            # 确保元素在可见区域内（不是负坐标）
-                            rect = tab.rect
-                            if rect['x'] > 0 and rect['y'] > 0:
-                                image_tab = tab
-                                break
-                    
-                    if image_tab:
-                        image_tab.click()
-                        logger.info("✅ 已切换到图文发布模式")
-                        await asyncio.sleep(2)  # 等待界面切换完成
-                    else:
-                        logger.warning("⚠️ 未找到图文发布选项卡，可能已经在图文模式")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ 切换图文模式时出错: {e}，继续执行...")
+                await self._click_publish_tab(driver, "上传图文")
                     
             elif has_videos:
                 logger.info("🔄 切换到视频发布模式...")
-                # 页面默认就是视频模式，检查是否需要切换
-                try:
-                    tabs = driver.find_elements(By.CSS_SELECTOR, ".creator-tab")
-                    video_tab = None
-                    
-                    for tab in tabs:
-                        if tab.is_displayed() and "上传视频" in tab.text:
-                            rect = tab.rect
-                            if rect['x'] > 0 and rect['y'] > 0:
-                                video_tab = tab
-                                break
-                    
-                    if video_tab and "active" not in video_tab.get_attribute("class"):
-                        video_tab.click()
-                        logger.info("✅ 已切换到视频发布模式")
-                        await asyncio.sleep(2)
-                    else:
-                        logger.info("✅ 已在视频发布模式")
-                        
-                except Exception as e:
-                    logger.warning(f"⚠️ 切换视频模式时出错: {e}，继续执行...")
+                await self._click_publish_tab(driver, "上传视频")
                     
         except Exception as e:
             logger.warning(f"⚠️ 模式切换过程出错: {e}，继续执行...")
+    
+    async def _click_publish_tab(self, driver, tab_text: str) -> bool:
+        """
+        智能点击发布模式选项卡
+        
+        Args:
+            driver: WebDriver实例
+            tab_text: 要点击的tab文本（如"上传图文"或"上传视频"）
+            
+        Returns:
+            是否点击成功
+        """
+        try:
+            # 1. 等待页面稳定，tooltip消失
+            await self._wait_for_overlays_to_disappear(driver)
+            
+            # 2. 使用模糊匹配查找正确的tab
+            target_tab = await self._find_visible_tab(driver, tab_text)
+            
+            if not target_tab:
+                logger.warning(f"⚠️ 未找到 {tab_text} 选项卡，可能已经在该模式")
+                return False
+            
+            # 3. 检查是否已经是active状态
+            tab_class = target_tab.get_attribute("class") or ""
+            if "active" in tab_class:
+                logger.info(f"✅ 已在 {tab_text} 模式")
+                return True
+            
+            # 4. 使用JavaScript点击，绕过任何遮挡元素
+            try:
+                driver.execute_script("arguments[0].click();", target_tab)
+                logger.info(f"✅ 已切换到 {tab_text} 模式（JS点击）")
+            except Exception as js_error:
+                logger.debug(f"JS点击失败: {js_error}，尝试常规点击...")
+                # 备用：滚动到元素并点击
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target_tab)
+                await asyncio.sleep(0.5)
+                target_tab.click()
+                logger.info(f"✅ 已切换到 {tab_text} 模式")
+            
+            await asyncio.sleep(2)  # 等待界面切换完成
+            return True
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 点击 {tab_text} 选项卡时出错: {e}，继续执行...")
+            return False
+    
+    async def _wait_for_overlays_to_disappear(self, driver, timeout: int = 5) -> None:
+        """
+        等待遮挡层（tooltip、loading等）消失
+        
+        Args:
+            driver: WebDriver实例
+            timeout: 超时时间（秒）
+        """
+        overlay_selectors = [
+            ".short-note-tooltip-text",  # 短笔记tooltip
+            "[class*='tooltip']",         # 通用tooltip
+            "[class*='loading']",          # loading遮罩
+            "[class*='overlay']",          # 通用遮罩
+            ".modal",                       # 模态框
+        ]
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            overlays_visible = False
+            
+            for selector in overlay_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        if element.is_displayed():
+                            # 检查元素是否真的在可见区域遮挡
+                            rect = element.rect
+                            if rect['width'] > 0 and rect['height'] > 0:
+                                overlays_visible = True
+                                logger.debug(f"等待遮挡层消失: {selector}")
+                                break
+                except:
+                    continue
+                    
+                if overlays_visible:
+                    break
+            
+            if not overlays_visible:
+                logger.debug("✅ 无遮挡层")
+                return
+            
+            await asyncio.sleep(0.3)
+        
+        logger.debug(f"⚠️ 等待遮挡层消失超时 ({timeout}s)，继续执行...")
+    
+    async def _find_visible_tab(self, driver, tab_text: str) -> Optional[Any]:
+        """
+        查找真正可见的tab元素（排除隐藏在-9999px的元素）
+        
+        Args:
+            driver: WebDriver实例
+            tab_text: tab文本
+            
+        Returns:
+            找到的tab元素，或None
+        """
+        try:
+            # 策略1: 通过XPath精确匹配可见的tab
+            # 查找包含指定文本的span，然后获取其父级creator-tab
+            xpath = f"//div[contains(@class, 'creator-tab')]//span[contains(@class, 'title')][contains(text(), '{tab_text}')]/ancestor::div[contains(@class, 'creator-tab')]"
+            
+            tabs = driver.find_elements(By.XPATH, xpath)
+            
+            for tab in tabs:
+                if not tab.is_displayed():
+                    continue
+                    
+                # 检查元素是否真的可见（不是隐藏在-9999px）
+                rect = tab.rect
+                location = tab.location
+                
+                # 排除隐藏元素（位置为负值或极端值）
+                if location['x'] < 0 or location['y'] < 0:
+                    logger.debug(f"跳过隐藏的tab: x={location['x']}, y={location['y']}")
+                    continue
+                
+                if rect['x'] < 0 or rect['y'] < 0:
+                    logger.debug(f"跳过rect为负的tab: rect={rect}")
+                    continue
+                
+                # 确保元素有合理的尺寸
+                if rect['width'] > 0 and rect['height'] > 0:
+                    logger.debug(f"✅ 找到可见的 {tab_text} tab: rect={rect}")
+                    return tab
+            
+            # 策略2: 通过CSS选择器查找
+            tabs = driver.find_elements(By.CSS_SELECTOR, ".creator-tab")
+            
+            for tab in tabs:
+                try:
+                    if not tab.is_displayed():
+                        continue
+                    
+                    if tab_text not in tab.text:
+                        continue
+                    
+                    # 获取计算后的样式，检查是否真的可见
+                    style = driver.execute_script(
+                        "return window.getComputedStyle(arguments[0]);", 
+                        tab
+                    )
+                    
+                    # 检查位置
+                    left = driver.execute_script(
+                        "return arguments[0].getBoundingClientRect().left;", 
+                        tab
+                    )
+                    
+                    if left is not None and left >= 0:
+                        logger.debug(f"✅ 通过CSS找到可见的 {tab_text} tab: left={left}")
+                        return tab
+                        
+                except Exception as e:
+                    logger.debug(f"检查tab时出错: {e}")
+                    continue
+            
+            logger.warning(f"⚠️ 未找到可见的 {tab_text} 选项卡")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 查找tab时出错: {e}")
+            return None
 
     async def _handle_file_upload(self, note: XHSNote) -> None:
         """统一处理文件上传（图片/视频）"""
@@ -378,6 +509,9 @@ class XHSClient:
             
             # 尝试多个内容选择器
             content_selectors = [
+                ".tiptap.ProseMirror",
+                "[data-placeholder*='输入正文']",
+                "[role='textbox']",
                 ".ql-editor",
                 "[placeholder*='内容']",
                 "[placeholder*='content']",
@@ -437,35 +571,27 @@ class XHSClient:
     async def _submit_note(self, note: XHSNote) -> XHSPublishResult:
         """提交发布笔记"""
         driver = self.browser_manager.driver
+        wait = WebDriverWait(driver, 30)
         
         try:
-            logger.info("🚀 点击发布按钮...")
+            logger.info("🚀 等待页面加载完毕...")
             
-            # 尝试多个发布按钮选择器
-            publish_selectors = [
-                ".publishBtn",
-                "[class*='publish']",
-                "button[type='submit']",
-                "//button[contains(text(), '发布')]",
-                "//button[contains(text(), '提交')]"
-            ]
+            # 1. 等待页面完全加载（DOM ready + 网络空闲）
+            await self._wait_for_page_ready(driver)
             
-            submit_btn = None
-            for selector in publish_selectors:
-                try:
-                    if selector.startswith("//"):
-                        submit_btn = driver.find_element(By.XPATH, selector)
-                    else:
-                        submit_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                    
-                    if submit_btn.is_displayed() and submit_btn.is_enabled():
-                        logger.info(f"✅ 找到发布按钮: {selector}")
-                        break
-                except:
-                    continue
+            logger.info("🔍 查找发布按钮...")
+            
+            # 2. 使用模糊匹配策略查找发布按钮
+            submit_btn = await self._find_publish_button_fuzzy(driver, wait)
             
             if not submit_btn:
                 raise PublishError("无法找到发布按钮", publish_step="查找发布按钮")
+            
+            # 3. 确保按钮可点击
+            try:
+                wait.until(EC.element_to_be_clickable((By.XPATH, "//*")))  # 确保页面可交互
+            except:
+                pass
             
             submit_btn.click()
             logger.info("✅ 发布按钮已点击")
@@ -483,6 +609,151 @@ class XHSClient:
             
         except Exception as e:
             raise PublishError(f"点击发布按钮失败: {str(e)}", publish_step="提交发布") from e
+    
+    async def _wait_for_page_ready(self, driver, timeout: int = 30) -> None:
+        """
+        等待页面完全加载（DOM ready + 资源加载）
+        
+        Args:
+            driver: WebDriver实例
+            timeout: 超时时间（秒）
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                # 检查document.readyState
+                ready_state = driver.execute_script("return document.readyState")
+                if ready_state == "complete":
+                    logger.debug("✅ 页面DOM加载完成")
+                    
+                    # 额外等待，确保动态内容渲染完成
+                    await asyncio.sleep(1)
+                    
+                    # 检查是否有未完成的AJAX请求（jQuery环境）
+                    try:
+                        jquery_active = driver.execute_script(
+                            "return (typeof jQuery !== 'undefined') ? jQuery.active : 0"
+                        )
+                        if jquery_active == 0:
+                            logger.debug("✅ 无活跃AJAX请求")
+                            return
+                    except:
+                        pass
+                    
+                    # 无jQuery则直接返回
+                    return
+                    
+            except Exception as e:
+                logger.debug(f"等待页面加载中... {e}")
+            
+            await asyncio.sleep(0.5)
+        
+        logger.warning(f"⚠️ 页面加载等待超时 ({timeout}s)，继续执行...")
+    
+    async def _find_publish_button_fuzzy(self, driver, wait) -> Optional[Any]:
+        """
+        使用模糊匹配策略查找发布按钮
+        
+        策略优先级:
+        1. 基于按钮文本内容的模糊匹配（最灵活）
+        2. 基于特定class结构的匹配（d-button-content）
+        3. 传统class选择器匹配
+        
+        Returns:
+            找到的按钮元素，或None
+        """
+        submit_btn = None
+        
+        # 策略1: 基于文本内容的模糊XPath匹配（最灵活，应对页面结构变化）
+        # 匹配任何包含"发布"文本的可点击元素
+        fuzzy_text_xpaths = [
+            # 匹配包含"发布"文本的span（基于提供的HTML结构）
+            "//div[contains(@class, 'd-button-content')]//span[contains(text(), '发布')]/ancestor::button",
+            "//div[contains(@class, 'd-button-content')]//span[contains(text(), '发布')]/ancestor::div[contains(@class, 'button')]",
+            # 匹配任何包含"发布"的button元素
+            "//button[.//text()[contains(., '发布')]]",
+            # 匹配包含"发布"文本的div按钮
+            "//div[contains(@class, 'button')][.//text()[contains(., '发布')]]",
+            # 更宽松的匹配
+            "//*[contains(@class, 'button')][.//span[contains(text(), '发布')]]",
+            "//*[contains(@class, 'btn')][.//text()[contains(., '发布')]]",
+            # 直接匹配发布文本的父级可点击元素
+            "//span[contains(text(), '发布')]/ancestor::*[self::button or contains(@class, 'button') or contains(@class, 'btn')][1]",
+        ]
+        
+        for xpath in fuzzy_text_xpaths:
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        # 验证元素确实包含"发布"文本
+                        if "发布" in element.text:
+                            submit_btn = element
+                            logger.info(f"✅ 通过模糊文本匹配找到发布按钮: {xpath[:50]}...")
+                            return submit_btn
+            except Exception as e:
+                logger.debug(f"XPath匹配尝试失败 {xpath[:30]}...: {e}")
+                continue
+        
+        # 策略2: 基于class结构的CSS选择器（匹配d-button-content结构）
+        class_selectors = [
+            ".d-button-content",  # 直接匹配按钮内容容器
+            "[class*='d-button']",  # 模糊匹配d-button相关class
+            ".d-text",  # 匹配文本元素
+        ]
+        
+        for selector in class_selectors:
+            try:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                for element in elements:
+                    if element.is_displayed() and "发布" in element.text:
+                        # 找到包含"发布"的元素，尝试获取其可点击的父级
+                        parent = element
+                        for _ in range(5):  # 向上查找最多5层
+                            try:
+                                parent = parent.find_element(By.XPATH, "..")
+                                tag = parent.tag_name.lower()
+                                class_attr = parent.get_attribute("class") or ""
+                                if tag == "button" or "button" in class_attr or "btn" in class_attr:
+                                    if parent.is_enabled():
+                                        submit_btn = parent
+                                        logger.info(f"✅ 通过class结构匹配找到发布按钮: {selector}")
+                                        return submit_btn
+                            except:
+                                break
+            except Exception as e:
+                logger.debug(f"CSS选择器尝试失败 {selector}: {e}")
+                continue
+        
+        # 策略3: 传统选择器匹配（兜底）
+        traditional_selectors = [
+            (".publishBtn", "css"),
+            ("[class*='publish']", "css"),
+            ("button[type='submit']", "css"),
+            ("//button[contains(text(), '发布')]", "xpath"),
+            ("//button[contains(text(), '提交')]", "xpath"),
+            ("//div[contains(@class, 'publish')]", "xpath"),
+        ]
+        
+        for selector, selector_type in traditional_selectors:
+            try:
+                if selector_type == "xpath":
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        submit_btn = element
+                        logger.info(f"✅ 通过传统选择器找到发布按钮: {selector}")
+                        return submit_btn
+            except Exception as e:
+                logger.debug(f"传统选择器尝试失败 {selector}: {e}")
+                continue
+        
+        logger.error("❌ 所有策略均未找到发布按钮")
+        return None
 
     @handle_exception
     async def upload_files_only(self, note: XHSNote) -> dict:
