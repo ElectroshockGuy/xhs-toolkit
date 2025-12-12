@@ -82,6 +82,14 @@ class XHSConfig:
         
         # 其他配置
         self.timeout = int(os.getenv("TIMEOUT", "30"))
+        
+        # RedInk 配置
+        self.redink_base_url = os.getenv("REDINK_BASE_URL", "https://redink.shunleite.com/api")
+        self.redink_output_dir = os.getenv("REDINK_OUTPUT_DIR", "./data/redink_output")
+        self.redink_timeout = int(os.getenv("REDINK_TIMEOUT", "600"))
+        self.redink_default_page_count = int(os.getenv("REDINK_DEFAULT_PAGE_COUNT", "8"))
+        self.redink_poll_interval = int(os.getenv("REDINK_POLL_INTERVAL", "3"))
+        self.redink_max_retries = int(os.getenv("REDINK_MAX_RETRIES", "2"))
     
     def _get_chrome_path(self) -> str:
         """获取Chrome浏览器路径"""
@@ -292,6 +300,12 @@ TIMEOUT=30
             "remote_browser_host": self.remote_browser_host,
             "remote_browser_port": self.remote_browser_port,
             "timeout": self.timeout,
+            "redink_base_url": self.redink_base_url,
+            "redink_output_dir": self.redink_output_dir,
+            "redink_timeout": self.redink_timeout,
+            "redink_default_page_count": self.redink_default_page_count,
+            "redink_poll_interval": self.redink_poll_interval,
+            "redink_max_retries": self.redink_max_retries,
             "platform": platform.system(),
             "python_version": platform.python_version()
         }

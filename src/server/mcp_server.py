@@ -25,6 +25,7 @@ from ..xiaohongshu.models import XHSNote
 from ..utils.logger import get_logger, setup_logger
 from ..data import storage_manager, data_scheduler
 from ..auth.smart_auth_server import SmartAuthServer, create_smart_auth_server
+from ..redink import RedInkClient
 
 logger = get_logger(__name__)
 
@@ -51,6 +52,36 @@ class PublishTask:
             data['note_has_videos'] = bool(self.note.videos)
             del data['note']
         return data
+
+
+@dataclass
+class RedInkTask:
+    """RedInk生成任务数据类"""
+    task_id: str
+    status: str  # "pending", "generating_outline", "generating_images", "downloading", "completed", "failed"
+    topic: str
+    page_count: int
+    progress: int  # 0-100
+    message: str
+    redink_task_id: str = None  # 红墨服务端的任务ID
+    result: Dict[str, Any] = None
+    start_time: float = None
+    end_time: float = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "topic": self.topic,
+            "page_count": self.page_count,
+            "progress": self.progress,
+            "message": self.message,
+            "redink_task_id": self.redink_task_id,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "elapsed_seconds": int(time.time() - self.start_time) if self.start_time else 0
+        }
 
 
 class TaskManager:
@@ -125,6 +156,8 @@ class MCPServer:
         self.xhs_client = XHSClient(config)
         self.mcp = FastMCP("小红书MCP服务器")
         self.task_manager = TaskManager()  # 添加任务管理器
+        self.redink_tasks: Dict[str, RedInkTask] = {}  # RedInk任务存储
+        self.redink_running_tasks: Dict[str, asyncio.Task] = {}  # RedInk运行中的任务
         self.scheduler_initialized = False  # 调度器初始化标志
         self.auth_server = create_smart_auth_server(config)  # 智能认证服务器
         self._setup_tools()
@@ -531,6 +564,364 @@ class MCPServer:
                     "message": error_msg
                 }, ensure_ascii=False, indent=2)
         
+        # ===========================================
+        # 红墨 (RedInk) 相关工具
+        # ===========================================
+        
+        @self.mcp.tool()
+        async def redink_create_post(
+            topic: str,
+            page_count: int = None,
+            output_dir: str = None
+        ) -> str:
+            """
+            启动小红书图文内容生成任务（异步后台执行）
+            
+            使用红墨服务根据主题自动生成大纲和图片。由于生成过程较长（可能需要几分钟），
+            此工具会立即返回任务ID，您可以使用 redink_check_task 查看进度。
+            
+            Args:
+                topic (str): 创作主题，如 "秋季显白美甲"、"冬季保暖穿搭"
+                page_count (int, optional): 生成页数，默认使用配置值（通常为8）
+                output_dir (str, optional): 图片输出目录，默认使用配置目录
+                
+            Returns:
+                str: JSON 格式，包含任务ID和状态查询方式
+                
+            示例:
+                redink_create_post(topic="秋季显白美甲")
+                # 返回任务ID后，使用 redink_check_task(task_id) 查看进度
+            """
+            logger.info(f"🎨 红墨一键生成: 主题='{topic}'")
+            
+            try:
+                # 使用配置中的默认值
+                actual_page_count = page_count or self.config.redink_default_page_count
+                actual_output_dir = output_dir or self.config.redink_output_dir
+                
+                # 创建本地任务ID
+                local_task_id = f"redink_{str(uuid.uuid4())[:8]}"
+                
+                # 创建任务记录
+                task = RedInkTask(
+                    task_id=local_task_id,
+                    status="pending",
+                    topic=topic,
+                    page_count=actual_page_count,
+                    progress=0,
+                    message="任务已创建，正在启动...",
+                    start_time=time.time()
+                )
+                self.redink_tasks[local_task_id] = task
+                
+                # 启动后台任务
+                async_task = asyncio.create_task(
+                    self._execute_redink_task(local_task_id, topic, actual_page_count, actual_output_dir)
+                )
+                self.redink_running_tasks[local_task_id] = async_task
+                
+                return json.dumps({
+                    "success": True,
+                    "message": f"🚀 红墨生成任务已启动！由于生成过程较长，请使用 redink_task_status 查看进度",
+                    "task_id": local_task_id,
+                    "topic": topic,
+                    "page_count": actual_page_count,
+                    "output_dir": actual_output_dir,
+                    "next_step": f"请调用 redink_task_status(task_id='{local_task_id}') 查看进度",
+                    "estimated_time": f"预计 {actual_page_count * 15}-{actual_page_count * 30} 秒"
+                }, ensure_ascii=False, indent=2)
+                
+            except Exception as e:
+                error_msg = f"红墨任务启动失败: {str(e)}"
+                logger.error(f"❌ {error_msg}")
+                return json.dumps({
+                    "success": False,
+                    "message": error_msg
+                }, ensure_ascii=False, indent=2)
+        
+        @self.mcp.tool()
+        async def redink_task_status(task_id: str) -> str:
+            """
+            检查红墨生成任务进度
+            
+            查询由 redink_create_post 启动的任务的当前状态和进度。
+            
+            Args:
+                task_id (str): 由 redink_create_post 返回的任务ID
+                
+            Returns:
+                str: JSON 格式的任务状态，包含进度、已完成的图片等
+            """
+            logger.info(f"📊 检查红墨任务进度: {task_id}")
+            
+            task = self.redink_tasks.get(task_id)
+            if not task:
+                return json.dumps({
+                    "success": False,
+                    "message": f"任务 {task_id} 不存在",
+                    "suggestion": "请确认任务ID是否正确，或任务可能已过期被清理"
+                }, ensure_ascii=False, indent=2)
+            
+            response = {
+                "success": True,
+                "task_id": task_id,
+                "status": task.status,
+                "progress": task.progress,
+                "message": task.message,
+                "topic": task.topic,
+                "page_count": task.page_count,
+                "elapsed_seconds": int(time.time() - task.start_time) if task.start_time else 0,
+                "is_completed": task.status in ["completed", "failed"]
+            }
+            
+            # 如果任务完成，包含结果
+            if task.result:
+                response["result"] = task.result
+            
+            # 添加下一步提示
+            if task.status == "completed":
+                response["next_step"] = "任务已完成！可使用 smart_publish_note 发布到小红书"
+            elif task.status == "failed":
+                response["next_step"] = "任务失败，请检查错误信息后重新尝试"
+            else:
+                response["next_step"] = f"任务进行中，请稍后再次调用 redink_task_status(task_id='{task_id}')"
+            
+            return json.dumps(response, ensure_ascii=False, indent=2)
+        
+        @self.mcp.tool()
+        async def redink_check_status() -> str:
+            """
+            检查红墨服务状态
+            
+            检测红墨服务是否可用，返回服务健康状态和当前配置信息。
+            
+            Returns:
+                str: JSON 格式的服务状态
+            """
+            logger.info("🔍 检查红墨服务状态")
+            
+            try:
+                client = RedInkClient(base_url=self.config.redink_base_url)
+                health = await client.health_check()
+                
+                response = {
+                    "success": health.get("success", False),
+                    "message": health.get("message", "未知状态"),
+                    "service_url": self.config.redink_base_url,
+                    "config": {
+                        "output_dir": self.config.redink_output_dir,
+                        "timeout": self.config.redink_timeout,
+                        "default_page_count": self.config.redink_default_page_count,
+                        "poll_interval": self.config.redink_poll_interval,
+                        "max_retries": self.config.redink_max_retries
+                    }
+                }
+                
+                return json.dumps(response, ensure_ascii=False, indent=2)
+                
+            except Exception as e:
+                error_msg = f"检查服务状态失败: {str(e)}"
+                logger.error(f"❌ {error_msg}")
+                return json.dumps({
+                    "success": False,
+                    "message": error_msg,
+                    "service_url": self.config.redink_base_url
+                }, ensure_ascii=False, indent=2)
+        
+        @self.mcp.tool()
+        async def redink_server_task(task_id: str) -> str:
+            """
+            获取红墨服务端任务详情
+            
+            查询红墨服务端指定任务的生成状态，包括已完成和失败的图片信息。
+            注意：此方法查询的是红墨服务端的任务，不是本地后台任务。
+            
+            Args:
+                task_id (str): 红墨服务端的任务ID（通常在任务完成后的 result.redink_task_id 中）
+                
+            Returns:
+                str: JSON 格式的任务详情
+            """
+            logger.info(f"📋 获取红墨任务详情: {task_id}")
+            
+            try:
+                client = RedInkClient(base_url=self.config.redink_base_url)
+                status = await client.get_task_status(task_id)
+                
+                if status.get("success"):
+                    state = status.get("state", {})
+                    response = {
+                        "success": True,
+                        "task_id": task_id,
+                        "generated": state.get("generated", {}),
+                        "failed": state.get("failed", {}),
+                        "has_cover": state.get("has_cover", False),
+                        "summary": {
+                            "total_generated": len(state.get("generated", {})),
+                            "total_failed": len(state.get("failed", {}))
+                        },
+                        "image_base_url": f"{self.config.redink_base_url}/images/{task_id}"
+                    }
+                else:
+                    response = {
+                        "success": False,
+                        "message": status.get("error", "获取任务状态失败"),
+                        "task_id": task_id
+                    }
+                
+                return json.dumps(response, ensure_ascii=False, indent=2)
+                
+            except Exception as e:
+                error_msg = f"获取任务详情失败: {str(e)}"
+                logger.error(f"❌ {error_msg}")
+                return json.dumps({
+                    "success": False,
+                    "message": error_msg,
+                    "task_id": task_id
+                }, ensure_ascii=False, indent=2)
+        
+        @self.mcp.tool()
+        async def redink_download_images(task_id: str, output_dir: str = None) -> str:
+            """
+            下载红墨任务生成的图片
+            
+            将指定任务的所有已生成图片下载到本地目录。
+            
+            Args:
+                task_id (str): 任务ID
+                output_dir (str, optional): 输出目录，默认使用配置目录
+                
+            Returns:
+                str: JSON 格式的下载结果
+            """
+            logger.info(f"⬇️ 下载红墨图片: task_id={task_id}")
+            
+            try:
+                actual_output_dir = output_dir or self.config.redink_output_dir
+                
+                client = RedInkClient(base_url=self.config.redink_base_url)
+                downloaded = await client.download_images(task_id, actual_output_dir)
+                
+                if downloaded:
+                    response = {
+                        "success": True,
+                        "message": f"✅ 已下载 {len(downloaded)} 张图片",
+                        "task_id": task_id,
+                        "output_dir": f"{actual_output_dir}/{task_id}",
+                        "images": downloaded
+                    }
+                else:
+                    response = {
+                        "success": False,
+                        "message": "未找到可下载的图片",
+                        "task_id": task_id
+                    }
+                
+                return json.dumps(response, ensure_ascii=False, indent=2)
+                
+            except Exception as e:
+                error_msg = f"下载图片失败: {str(e)}"
+                logger.error(f"❌ {error_msg}")
+                return json.dumps({
+                    "success": False,
+                    "message": error_msg,
+                    "task_id": task_id
+                }, ensure_ascii=False, indent=2)
+    
+    async def _execute_redink_task(
+        self, 
+        local_task_id: str, 
+        topic: str, 
+        page_count: int, 
+        output_dir: str
+    ) -> None:
+        """
+        执行红墨生成任务的后台逻辑
+        
+        Args:
+            local_task_id: 本地任务ID
+            topic: 创作主题
+            page_count: 页数
+            output_dir: 输出目录
+        """
+        task = self.redink_tasks.get(local_task_id)
+        if not task:
+            logger.error(f"❌ RedInk任务 {local_task_id} 不存在")
+            return
+        
+        try:
+            # 创建客户端
+            client = RedInkClient(
+                base_url=self.config.redink_base_url,
+                timeout=self.config.redink_timeout,
+                poll_interval=self.config.redink_poll_interval,
+                max_retries=self.config.redink_max_retries
+            )
+            
+            # 进度回调
+            def progress_callback(phase: str, message: str, percent: int):
+                task.progress = percent
+                task.message = f"[{phase}] {message}"
+                task.status = "generating"
+                logger.info(f"📊 RedInk任务 {local_task_id}: {percent}% - {message}")
+            
+            # 更新状态
+            task.status = "generating"
+            task.progress = 5
+            task.message = "正在检查服务状态..."
+            
+            # 执行一键生成
+            result = await client.create_post(
+                topic=topic,
+                page_count=page_count,
+                output_dir=output_dir,
+                progress_callback=progress_callback
+            )
+            
+            if result.success:
+                task.status = "completed"
+                task.progress = 100
+                task.message = "✅ 生成完成！"
+                task.redink_task_id = result.task_id
+                task.end_time = time.time()
+                task.result = {
+                    "redink_task_id": result.task_id,
+                    "topic": result.topic,
+                    "outline": result.outline,
+                    "pages": [
+                        {
+                            "index": p.index,
+                            "type": p.type,
+                            "content": p.content[:200] + "..." if len(p.content) > 200 else p.content,
+                            "image_url": p.image_url
+                        }
+                        for p in result.pages
+                    ],
+                    "stats": result.stats,
+                    "local_images": result.local_images,
+                    "download_url": result.download_url,
+                    "output_dir": f"{output_dir}/{result.task_id}"
+                }
+                logger.info(f"✅ RedInk任务 {local_task_id} 完成")
+            else:
+                task.status = "failed"
+                task.progress = 0
+                task.message = f"❌ 生成失败: {result.error}"
+                task.end_time = time.time()
+                task.result = {"error": result.error}
+                logger.error(f"❌ RedInk任务 {local_task_id} 失败: {result.error}")
+                
+        except Exception as e:
+            task.status = "failed"
+            task.progress = 0
+            task.message = f"❌ 任务执行出错: {str(e)}"
+            task.end_time = time.time()
+            task.result = {"error": str(e)}
+            logger.error(f"❌ RedInk任务 {local_task_id} 异常: {e}")
+        finally:
+            # 清理运行任务记录
+            if local_task_id in self.redink_running_tasks:
+                del self.redink_running_tasks[local_task_id]
     
     async def _execute_publish_task(self, task_id: str) -> None:
         """

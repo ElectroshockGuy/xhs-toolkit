@@ -84,6 +84,7 @@ xhs_cookies.json
 
 # 数据
 data/creator_db/
+data/redink_output
 
 # 其他
 .cursorrules
