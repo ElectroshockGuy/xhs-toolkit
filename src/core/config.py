@@ -75,6 +75,10 @@ class XHSConfig:
         self.enable_remote_browser = os.getenv("ENABLE_REMOTE_BROWSER", "false").lower() == "true"
         self.remote_browser_host = os.getenv("REMOTE_BROWSER_HOST", "localhost")
         self.remote_browser_port = int(os.getenv("REMOTE_BROWSER_PORT", "9222"))
+        self.chrome_user_data_dir = os.getenv("CHROME_USER_DATA_DIR", "").strip()
+        if not self.chrome_user_data_dir and self.enable_remote_browser:
+            # 兼容常见的Selenium远程容器默认目录
+            self.chrome_user_data_dir = "/home/seluser/google-chrome-data"
         
         # 其他配置
         self.timeout = int(os.getenv("TIMEOUT", "30"))
@@ -236,6 +240,8 @@ DISABLE_IMAGES=false
 DEBUG_MODE=false
 # 无头浏览器模式（true=启用无头模式，false=显示浏览器界面）
 HEADLESS=false
+# Chrome用户数据目录（可选，本地留空使用默认，远程容器常用 /home/seluser/google-chrome-data）
+CHROME_USER_DATA_DIR=
 
 # 远程浏览器连接配置
 # 是否启用远程浏览器连接（true=连接远程浏览器，false=启动本地浏览器）

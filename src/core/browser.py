@@ -6,6 +6,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -155,9 +156,17 @@ class ChromeDriverManager:
         # 窗口大小
         chrome_options.add_argument('--window-size=1920,1080')
 
-        # 添加文件保存位置
-        chrome_options.add_argument(f'--user-data-dir=/home/seluser/google-chrome-data')
-        
+        # 用户数据目录（可配置，本地默认不指定，远程容器默认 /home/seluser/google-chrome-data）
+        user_data_dir = self.config.chrome_user_data_dir
+        if user_data_dir:
+            if not self.config.enable_remote_browser:
+                # 确保本地目录存在，避免 profile 创建失败
+                Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+            chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
+            logger.debug(f"使用用户数据目录: {user_data_dir}")
+        else:
+            logger.debug("未指定用户数据目录，使用Chrome默认profile")
+
         # 调试选项
         if self.config.debug_mode:
             chrome_options.add_argument('--enable-logging')
